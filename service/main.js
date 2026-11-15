@@ -7120,6 +7120,16 @@ var modifiersMask = (modifiers) => (modifiers.alt ? 1 : 0) | (modifiers.ctrl ? 2
 var mouseButton = (button) => BUTTON_NAMES[button] ?? "none";
 var heldButton = (buttons) => buttons & 1 ? "left" : buttons & 2 ? "right" : buttons & 4 ? "middle" : "none";
 var baseCharacter = (key, code) => code === `Key${key.toUpperCase()}` || code === `Digit${key}`;
+var sameDirection = (a, b) => a === 0 || b === 0 || Math.sign(a) === Math.sign(b);
+var mergeWheel = (current, next) => {
+  if (current.modifiers.ctrl || current.modifiers.meta || next.type !== "wheel" || next.x !== current.x || next.y !== current.y || modifiersMask(next.modifiers) !== modifiersMask(current.modifiers) || !sameDirection(current.deltaX, next.deltaX) || !sameDirection(current.deltaY, next.deltaY)) return null;
+  const deltaX = current.deltaX + next.deltaX;
+  const deltaY = current.deltaY + next.deltaY;
+  if (!Number.isFinite(deltaX) || !Number.isFinite(deltaY)) return null;
+  return { ...current, deltaX, deltaY };
+};
+var isHoverMove = (event) => event.type === "pointer" && event.action === "move" && event.buttons === 0;
+var isContinuousInput = (event) => isHoverMove(event) || event.type === "wheel" && !event.modifiers.ctrl && !event.modifiers.meta;
 var dispatchInput = async (page, event, scale, clickCount) => {
   if (event.type === "text") {
     await page.cdp.sendSession(page.sessionId, "Input.insertText", { text: event.text });
@@ -7202,7 +7212,8 @@ var stopScreencast = (page) => {
   if (page?.cdp.isOpen) void page.cdp.sendSession(page.sessionId, "Page.stopScreencast").catch(() => {
   });
 };
-var createSurface = (runtime) => {
+var createSurface = (runtime, { onInputError = () => {
+} } = {}) => {
   const waiters = /* @__PURE__ */ new Set();
   let page = null;
   let unsubscribe = null;
@@ -7213,6 +7224,75 @@ var createSurface = (runtime) => {
   let target = 0;
   let swallowEscapeUp = false;
   let lastPress = null;
+  const pendingInput = /* @__PURE__ */ new Set();
+  const inputQueue = [];
+  let inputPump = null;
+  let inputError = null;
+  const throwInputError = () => {
+    if (!inputError) return;
+    const error = inputError;
+    inputError = null;
+    throw error;
+  };
+  const flushInput = async () => {
+    const expected = target;
+    while (inputPump || pendingInput.size > 0) {
+      if (inputPump) await inputPump;
+      if (pendingInput.size > 0) await Promise.all([...pendingInput]);
+    }
+    requireInputView(expected);
+    throwInputError();
+  };
+  const requireInputView = (expected) => {
+    if (closed) throw new Error("Surface is closed");
+    if (target !== expected) throw new Error("The browser view changed before this input arrived");
+  };
+  const reportInputError = (error, expected) => {
+    if (!closed && target === expected && !inputError) {
+      inputError = error;
+      onInputError(error);
+    }
+  };
+  const submitHover = (current, event, scale, expected) => {
+    const completion = dispatchInput(current, event, scale, 0).then(
+      () => {
+        pendingInput.delete(completion);
+      },
+      (error) => {
+        pendingInput.delete(completion);
+        reportInputError(error, expected);
+      }
+    );
+    pendingInput.add(completion);
+  };
+  const pumpInput = () => {
+    if (inputPump || inputQueue.length === 0) return;
+    const expected = target;
+    const completion = (async () => {
+      while (!closed && target === expected && inputQueue.length > 0) {
+        const item = inputQueue.shift();
+        if (isHoverMove(item.event)) submitHover(item.page, item.event, item.scale, expected);
+        else await dispatchInput(item.page, item.event, item.scale, 0);
+      }
+    })().catch((error) => {
+      if (target === expected) inputQueue.length = 0;
+      reportInputError(error, expected);
+    });
+    inputPump = completion;
+    void completion.then(() => {
+      if (inputPump !== completion) return;
+      inputPump = null;
+      pumpInput();
+    });
+  };
+  const submitContinuous = (current, event) => {
+    const previous = inputQueue.at(-1);
+    const compatible = previous?.page.sessionId === current.sessionId && previous.scale === runtime.scale;
+    const merged = compatible && previous.event.type === "wheel" ? mergeWheel(previous.event, event) : compatible && isHoverMove(previous.event) && isHoverMove(event) && modifiersMask(previous.event.modifiers) === modifiersMask(event.modifiers) ? event : null;
+    if (merged) previous.event = merged;
+    else inputQueue.push({ page: current, event, scale: runtime.scale });
+    pumpInput();
+  };
   const clickCount = (event) => {
     if (event.type !== "pointer" || event.action === "move") return 0;
     if (event.action === "up") return lastPress?.count ?? 1;
@@ -7271,6 +7351,7 @@ var createSurface = (runtime) => {
           format: "jpeg",
           // DevTools is small text; 72 blurs it.
           quality: current.devtools ? 90 : 72,
+          // Skipping the first frame can leave a static page with no picture.
           everyNthFrame: 1
         });
       } catch (error) {
@@ -7322,8 +7403,17 @@ var createSurface = (runtime) => {
     },
     async input(events, theme = null) {
       const current = await start();
+      const expected = target;
+      throwInputError();
       const menu = current.devtools ? null : runtime.contextMenu;
-      for (const event of events) {
+      for (let index = 0; index < events.length; index += 1) {
+        let event = events[index];
+        requireInputView(expected);
+        const continuous = isContinuousInput(event) && !menu?.isOpen;
+        if (!continuous) {
+          await flushInput();
+          requireInputView(expected);
+        }
         if (event.type === "key" && event.key === "Escape" && event.action === "up" && swallowEscapeUp) {
           swallowEscapeUp = false;
           continue;
@@ -7337,21 +7427,35 @@ var createSurface = (runtime) => {
             continue;
           }
         }
+        if (event.type === "wheel") {
+          while (index + 1 < events.length) {
+            const merged = mergeWheel(event, events[index + 1]);
+            if (!merged) break;
+            event = merged;
+            index += 1;
+          }
+        }
         if (secondary && event.action === "down") await menu.observe(current).catch(() => {
         });
-        await dispatchInput(current, event, runtime.scale, clickCount(event));
+        if (continuous) submitContinuous(current, event);
+        else await dispatchInput(current, event, runtime.scale, clickCount(event));
         if (secondary && event.action === "up") await menu.settle(current, theme).catch(() => {
         });
       }
     },
+    flushInput,
     control(controller) {
-      if (runtime.controller !== controller) void runtime.contextMenu.close();
+      const changed = runtime.controller !== controller;
+      if (changed) void runtime.contextMenu.close();
       runtime.controller = controller;
+      if (changed) return flushInput();
     },
-    resize(size) {
+    async resize(size) {
+      await flushInput();
       return runtime.setPanelSize(size);
     },
     async clipboard() {
+      await flushInput();
       const current = await start();
       const response = await current.cdp.sendSession(current.sessionId, "Runtime.evaluate", {
         expression: clipboardExpression,
@@ -7363,6 +7467,10 @@ var createSurface = (runtime) => {
     // the next request starts on the new tab.
     retarget() {
       target += 1;
+      pendingInput.clear();
+      inputQueue.length = 0;
+      inputPump = null;
+      inputError = null;
       lastPress = null;
       detach();
       latest = null;
@@ -7371,6 +7479,10 @@ var createSurface = (runtime) => {
     async close() {
       if (closed) return;
       closed = true;
+      pendingInput.clear();
+      inputQueue.length = 0;
+      inputPump = null;
+      inputError = null;
       for (const waiter of waiters) finishWaiter(waiter, null);
       await startPromise?.catch(() => {
       });
@@ -7846,6 +7958,7 @@ var createBrowserRuntime = ({
     await devtools?.resize(devtoolsSize());
   };
   runtime.configureViewport = async ({ mode, source, width, height, mobile }) => {
+    await surface.flushInput();
     viewportConfig = {
       ...viewportConfig,
       mode,
@@ -7870,6 +7983,7 @@ var createBrowserRuntime = ({
   };
   runtime.command = async (name, parameters = {}) => {
     if (closed) throw new Error("Browser runtime is closed");
+    await surface.flushInput();
     await contextMenu.close();
     if (name === "tab-new") {
       await openTab();
@@ -7929,7 +8043,12 @@ var createBrowserRuntime = ({
     await refreshNavigation(current);
   };
   const execute = createBrowserActions(runtime);
-  const surface = createSurface(runtime);
+  const surface = createSurface(runtime, {
+    onInputError(error) {
+      const current = activeTab();
+      if (!closed && current) addProblem(current, { level: "error", message: `Browser input failed: ${error.message}`, source: "browser" });
+    }
+  });
   let copyRequest = null;
   const offerCopy = (text2, { devtools: devtools2 = false } = {}) => {
     copyRequest = { id: crypto4.randomUUID(), text: text2.length > GUEST_CLIPBOARD_TEXT_MAX ? null : text2, at: Date.now(), devtools: devtools2 };
@@ -7965,6 +8084,8 @@ var createBrowserRuntime = ({
       if (runtime.controller === "user") {
         throw new Error("The user controls the browser. Wait for them to hand control back.");
       }
+      await surface.flushInput();
+      signal.throwIfAborted();
       await contextMenu.close();
       runtime.agentActive = true;
       try {
@@ -7983,6 +8104,7 @@ var createBrowserRuntime = ({
   runtime.surfaceControl = (controller) => surface.control(controller);
   runtime.surfaceResize = (size) => surface.resize(size);
   runtime.surfaceClipboard = async () => {
+    await surface.flushInput();
     if (copyRequest?.devtools && copyRequest.text && Date.now() - copyRequest.at < 1e3) {
       const { text: text2 } = copyRequest;
       copyRequest = null;

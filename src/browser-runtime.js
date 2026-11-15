@@ -546,6 +546,7 @@ export const createBrowserRuntime = ({
   };
 
   runtime.configureViewport = async ({ mode, source, width, height, mobile }) => {
+    await surface.flushInput();
     viewportConfig = {
       ...viewportConfig,
       mode,
@@ -580,6 +581,7 @@ export const createBrowserRuntime = ({
   // follow page events, so a slow page can still be stopped.
   runtime.command = async (name, parameters = {}) => {
     if (closed) throw new Error('Browser runtime is closed');
+    await surface.flushInput();
     await contextMenu.close();
     if (name === 'tab-new') {
       await openTab();
@@ -643,7 +645,12 @@ export const createBrowserRuntime = ({
   };
 
   const execute = createBrowserActions(runtime);
-  const surface = createSurface(runtime);
+  const surface = createSurface(runtime, {
+    onInputError(error) {
+      const current = activeTab();
+      if (!closed && current) addProblem(current, { level: 'error', message: `Browser input failed: ${error.message}`, source: 'browser' });
+    },
+  });
 
   // Text copied in the shared browser, for the dock to put on the viewer's clipboard.
   let copyRequest = null;
@@ -683,6 +690,8 @@ export const createBrowserRuntime = ({
       if (runtime.controller === 'user') {
         throw new Error('The user controls the browser. Wait for them to hand control back.');
       }
+      await surface.flushInput();
+      signal.throwIfAborted();
       await contextMenu.close();
       runtime.agentActive = true;
       try {
@@ -705,6 +714,7 @@ export const createBrowserRuntime = ({
   // element in Elements; the host reads right after the chord, so that copy
   // goes out here instead of through the dock.
   runtime.surfaceClipboard = async () => {
+    await surface.flushInput();
     if (copyRequest?.devtools && copyRequest.text && Date.now() - copyRequest.at < 1_000) {
       const { text } = copyRequest;
       copyRequest = null;

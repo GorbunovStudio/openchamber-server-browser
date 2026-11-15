@@ -43,6 +43,9 @@ The bundles are committed, because Git installations use them as they are. Rebui
 
 ## Validation
 
+See [Surface input backpressure](surface-input.md) for continuous-input queueing,
+discrete-input barriers, and the ordering regressions covered by the tests.
+
 The automated suite runs real Chrome where it can.
 
 | Covers | Checks |

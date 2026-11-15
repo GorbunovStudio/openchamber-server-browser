@@ -40,6 +40,22 @@ body { margin: 0; font-family: sans-serif; min-height: 2400px; }
 const startWebFixture = async () => {
   const server = http.createServer((request, response) => {
     response.setHeader('content-type', 'text/html; charset=utf-8');
+    if (request.url === '/input-frame') {
+      response.end(html('<iframe src="/input-pipeline" style="border:0;width:832px;height:1235px"></iframe>', 'Input frame'));
+      return;
+    }
+    if (request.url === '/input-pipeline') {
+      response.end(html(`
+        <div id="area" style="position:absolute;left:10px;top:10px;width:500px;height:500px;overflow:auto"><div style="height:8000px;background:linear-gradient(white,#acf)">Nested scrolling</div></div>
+        <button id="done" style="position:fixed;left:600px;top:50px;width:130px;height:44px" onclick="window.inputState.clicks.push({ wheelDelta: window.inputState.wheelDelta, scrollTop: document.querySelector('#area').scrollTop })">Check order</button>
+        <script>
+          window.inputState = { wheelDelta: 0, keys: [], clicks: [] };
+          document.querySelector('#area').addEventListener('wheel', (event) => { window.inputState.wheelDelta += event.deltaY; }, { passive: true });
+          addEventListener('keydown', (event) => { if (event.key === 'k') window.inputState.keys.push({ wheelDelta: window.inputState.wheelDelta, scrollTop: document.querySelector('#area').scrollTop }); });
+        </script>
+      `, 'Input pipeline'));
+      return;
+    }
     if (request.url === '/selects') {
       response.setHeader('content-security-policy', "default-src 'self'; style-src 'none'; script-src 'unsafe-inline'");
       response.end(html(`
@@ -826,6 +842,103 @@ test('sizes pages in CSS pixels for the viewer and keeps a chosen size fixed', {
   // When the dock returns to Auto, then the page follows the latest panel size again.
   await manager.setViewport({ mode: 'auto', mobile: false }, manager.state().generation);
   assert.equal(await innerSize(), '[600,400]');
+});
+
+test('pipelines separate viewer packets while preserving nested scroll, key, and click order', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {
+  const web = await startWebFixture();
+  context.after(() => close(web.server));
+  let runtime;
+  const manager = createBrowserManager({ createRuntime: () => (runtime = createBrowserRuntime({ chromePath, allowedOrigins: [web.origin] })) });
+  context.after(() => manager.close());
+  await manager.setDevicePixelRatio(2);
+  await assert.rejects(manager.surfaceResize({ width: 1664, height: 2470 }), /no browser scope/i);
+  await manager.perform('browser.open', { url: `${web.origin}/input-pipeline` }, undefined, { directory: '/test', sessionId: 'pipelined-input' });
+  const page = await runtime.ensurePage();
+  const evaluate = async (expression) => (await page.cdp.sendSession(page.sessionId, 'Runtime.evaluate', { expression, returnByValue: true })).result.value;
+  const input = (events) => manager.surfaceInput(events, { viewer: 'test-viewer', frameSeq: 0 });
+  await manager.surfaceFrame({ after: 0, wait: 10_000 });
+
+  for (let i = 0; i < 60; i += 1) {
+    await input([{ type: 'pointer', action: 'move', x: 200 + i * 2, y: 400, button: -1, buttons: 0, modifiers }]);
+    await input([{ type: 'wheel', x: 400, y: 400, deltaX: 0, deltaY: 6, modifiers }]);
+  }
+  await input([
+    { type: 'key', action: 'down', key: 'k', code: 'KeyK', modifiers },
+    { type: 'key', action: 'up', key: 'k', code: 'KeyK', modifiers },
+  ]);
+  await input([
+    { type: 'pointer', action: 'down', x: 1260, y: 140, button: 0, buttons: 1, modifiers },
+    { type: 'pointer', action: 'up', x: 1260, y: 140, button: 0, buttons: 0, modifiers },
+  ]);
+  await waitFor(async () => await evaluate('document.querySelector("#area").scrollTop') === 360);
+  const observed = JSON.parse(await evaluate('JSON.stringify(window.inputState)'));
+  assert.equal(observed.wheelDelta, 360);
+  assert.deepEqual(observed.keys.map(({ wheelDelta }) => wheelDelta), [360]);
+  assert.deepEqual(observed.clicks.map(({ wheelDelta }) => wheelDelta), [360]);
+  // The original awaited-wheel path can still be animating the final 6 pixels.
+  // Preserve event order without claiming to wait for application animations.
+  assert.ok([...observed.keys, ...observed.clicks].every(({ scrollTop }) => scrollTop >= 354 && scrollTop <= 360));
+  await manager.surfaceControl('none');
+  assert.match((await manager.perform('browser.snapshot', {}, undefined, { directory: '/test', sessionId: 'pipelined-input' })).text, /Nested scrolling/);
+});
+
+test('preserves queued wheel distance and key/click ordering inside an iframe', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {
+  const web = await startWebFixture();
+  context.after(() => close(web.server));
+  const runtime = createBrowserRuntime({ chromePath, allowedOrigins: [web.origin] });
+  context.after(() => runtime.close());
+  await runtime.perform('browser.open', { url: `${web.origin}/input-frame` });
+  await runtime.surfaceFrame({ after: 0, wait: 2000 });
+  const page = await runtime.ensurePage();
+  const evaluate = async (expression) => (await page.cdp.sendSession(page.sessionId, 'Runtime.evaluate', { expression, returnByValue: true })).result.value;
+  await waitFor(() => evaluate('!!document.querySelector("iframe").contentWindow.inputState'));
+  await runtime.surfaceInput([
+    { type: 'pointer', action: 'down', x: 200, y: 200, button: 0, buttons: 1, modifiers },
+    { type: 'pointer', action: 'up', x: 200, y: 200, button: 0, buttons: 0, modifiers },
+  ]);
+  for (let i = 0; i < 60; i += 1) {
+    await runtime.surfaceInput([{ type: 'wheel', x: 200, y: 200, deltaX: 0, deltaY: 6, modifiers }]);
+  }
+  await runtime.surfaceInput([{ type: 'key', action: 'down', key: 'k', code: 'KeyK', modifiers }, { type: 'key', action: 'up', key: 'k', code: 'KeyK', modifiers }]);
+  await runtime.surfaceInput([
+    { type: 'pointer', action: 'down', x: 630, y: 70, button: 0, buttons: 1, modifiers },
+    { type: 'pointer', action: 'up', x: 630, y: 70, button: 0, buttons: 0, modifiers },
+  ]);
+  await waitFor(() => evaluate('document.querySelector("iframe").contentDocument.querySelector("#area").scrollTop === 360'));
+  const observed = JSON.parse(await evaluate('JSON.stringify(document.querySelector("iframe").contentWindow.inputState)'));
+  assert.equal(observed.wheelDelta, 360);
+  assert.deepEqual(observed.keys.map(({ wheelDelta }) => wheelDelta), [360]);
+  assert.deepEqual(observed.clicks.map(({ wheelDelta }) => wheelDelta), [360]);
+});
+
+test('reports rejected continuous CDP input through the browser problem state', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {
+  const runtime = createBrowserRuntime({ chromePath });
+  context.after(() => runtime.close());
+  const page = await runtime.ensurePage();
+  const original = page.cdp.sendSession;
+  page.cdp.sendSession = (sessionId, method, params) => method === 'Input.dispatchMouseEvent' && params.type === 'mouseMoved'
+    ? Promise.reject(new Error('diagnostic input rejection'))
+    : original(sessionId, method, params);
+  context.after(() => { page.cdp.sendSession = original; });
+  await runtime.surfaceInput([{ type: 'pointer', action: 'move', x: 20, y: 20, button: -1, buttons: 0, modifiers }]);
+  await waitFor(() => runtime.problemCounts.errors === 1);
+  assert.match(runtime.consoleProblems()[0].message, /diagnostic input rejection/);
+  await assert.rejects(runtime.surfaceInput([{ type: 'text', text: 'must not replay' }]), /diagnostic input rejection/);
+});
+
+test('coalesces viewer wheel batches without losing scroll distance', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {
+  const web = await startWebFixture();
+  context.after(() => close(web.server));
+  const runtime = createBrowserRuntime({ chromePath, allowedOrigins: [web.origin] });
+  context.after(() => runtime.close());
+  await runtime.perform('browser.open', { url: web.origin });
+  const page = await runtime.ensurePage();
+  const evaluate = async (expression) => (await page.cdp.sendSession(page.sessionId, 'Runtime.evaluate', { expression, returnByValue: true })).result.value;
+  await evaluate("window.wheelDeltas = []; addEventListener('wheel', (event) => window.wheelDeltas.push(event.deltaY), { passive: true }); true");
+
+  await runtime.surfaceInput(Array.from({ length: 4 }, () => ({ type: 'wheel', x: 300, y: 300, deltaX: 0, deltaY: 60, modifiers })));
+  await waitFor(async () => await evaluate('scrollY') === 240);
+  assert.equal(await evaluate('JSON.stringify(window.wheelDeltas)'), '[240]');
 });
 
 test('shows the viewer menu only for right clicks the page leaves alone', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {
